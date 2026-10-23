@@ -36,13 +36,6 @@ ENV NODE_ENV=production
 ENV PORT=3001
 ENV FREELLMAPI_INSTALL_METHOD=docker
 
-# Vercel Containers may inject PORT=80. Keep the application unprivileged
-# while allowing Node to bind that platform-assigned port.
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends libcap2-bin \
-  && setcap cap_net_bind_service=+ep "$(readlink -f "$(command -v node)")" \
-  && rm -rf /var/lib/apt/lists/*
-
 COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 # npm nests some production packages under the workspace instead of hoisting

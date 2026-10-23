@@ -43,6 +43,18 @@ if [ "$(id -u)" = "0" ]; then
     ensure_owned "$(dirname "$FREEAPI_DB_BACKUP_PATH")"
   fi
 
+  # Vercel Containers inject PORT=80 and strip file capabilities from the
+  # image. Retain root only for a platform-assigned privileged port; regular
+  # Docker/PaaS deployments continue to run the application as `node`.
+  case "${PORT:-3001}" in
+    *[!0-9]*|'') ;;
+    *)
+      if [ "$PORT" -lt 1024 ]; then
+        exec "$@"
+      fi
+      ;;
+  esac
+
   # setpriv ships in util-linux on node:22-bookworm-slim, so it is always
   # present; exec'ing it keeps node as PID 1 so signals reach the server.
   exec setpriv --reuid=node --regid=node --init-groups -- "$@"
