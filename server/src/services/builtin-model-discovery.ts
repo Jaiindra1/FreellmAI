@@ -1,6 +1,7 @@
 import type { Db } from '../db/types.js';
 import type { Scheduler } from '../lib/scheduler.js';
 import type { Platform } from '@freellmapi/shared/types.js';
+import { getWorkspaceScope } from '../db/index.js';
 import { getProvider } from '../providers/index.js';
 import { OpenAICompatProvider } from '../providers/openai-compat.js';
 import { decrypt } from '../lib/crypto.js';
@@ -333,22 +334,24 @@ export function triggerBuiltinModelDiscovery(
 ): Promise<BuiltinDiscoveryResult> | null {
   if (builtinDiscoveryMode() !== 'auto') return null;
   if (!isBuiltinDiscoveryEligible(db, platform)) return null;
-  const pending = inFlight.get(platform);
+  const scope = getWorkspaceScope();
+  const key = `${scope}:${platform}`;
+  const pending = inFlight.get(key);
   if (pending) return pending;
   if (reason === 'healthy') {
     const hasModels = db.prepare('SELECT 1 FROM models WHERE platform = ? LIMIT 1').get(platform);
     if (hasModels) return null;
-    const last = lastEventRunMs.get(platform) ?? 0;
+    const last = lastEventRunMs.get(key) ?? 0;
     if (Date.now() - last < EVENT_MIN_GAP_MS) return null;
   }
-  lastEventRunMs.set(platform, Date.now());
+  lastEventRunMs.set(key, Date.now());
   const run = runBuiltinModelDiscovery(db, platform)
     .catch((err: unknown): BuiltinDiscoveryResult => {
       console.error(`[builtin-model-discovery] ${platform}: ${(err as Error)?.message ?? err}`);
       return { platforms: 0, added: 0, skipped: 0, tombstoned: 0, nonChatSkipped: 0, paidSkipped: 0, failures: [] };
     })
-    .finally(() => inFlight.delete(platform));
-  inFlight.set(platform, run);
+    .finally(() => inFlight.delete(key));
+  inFlight.set(key, run);
   return run;
 }
 

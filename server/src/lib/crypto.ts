@@ -179,6 +179,16 @@ export function isEncryptionKeyInitialized(): boolean {
   return cachedKey !== null;
 }
 
+/** Keep a temporary schema migration from replacing the active install key. */
+export function withEncryptionKeyState<T>(callback: () => T): T {
+  const previous = cachedKey;
+  try {
+    return callback();
+  } finally {
+    cachedKey = previous;
+  }
+}
+
 export function encrypt(text: string): { encrypted: string; iv: string; authTag: string } {
   const key = getEncryptionKey();
   const iv = crypto.randomBytes(16);

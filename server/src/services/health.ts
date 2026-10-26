@@ -1,4 +1,4 @@
-import { getDb } from '../db/index.js';
+import { getDb, getWorkspaceScope } from '../db/index.js';
 import { resolveProvider } from '../providers/index.js';
 import { BaseProvider } from '../providers/base.js';
 import { decrypt } from '../lib/crypto.js';
@@ -82,7 +82,8 @@ function positiveIntEnv(raw: string | undefined, fallback: number): number {
 }
 
 // Track consecutive failures per key
-const failureCount = new Map<number, number>();
+const failureCount = new Map<string, number>();
+const scopedKey = (keyId: number): string => `${getWorkspaceScope()}:${keyId}`;
 
 // #1510: consecutive transport errors per key. A key whose provider has been
 // unreachable (DNS, connection refused, TCP timeout) for this many probes in a
@@ -110,7 +111,7 @@ export function getTransportParkAfter(): number {
   return positiveIntEnv(process.env.HEALTH_TRANSPORT_PARK_AFTER, 0);
 }
 
-const transportFailures = new Map<number, number>();
+const transportFailures = new Map<string, number>();
 
 /** Test seam: drop transport-parking state. */
 export function clearTransportFailureState(): void {
@@ -123,8 +124,9 @@ export function clearTransportFailureState(): void {
 function recordTransportFailure(keyId: number, platform: string | undefined): boolean {
   const parkAfter = getTransportParkAfter();
   if (parkAfter === 0) return false;
-  const count = (transportFailures.get(keyId) ?? 0) + 1;
-  transportFailures.set(keyId, count);
+  const key = scopedKey(keyId);
+  const count = (transportFailures.get(key) ?? 0) + 1;
+  transportFailures.set(key, count);
   if (count < parkAfter) return false;
 
   // Park: 'error' is out of rotation (the router only routes healthy/unknown)
@@ -154,7 +156,7 @@ function recordTransportFailure(keyId: number, platform: string | undefined): bo
 // Forced passes (dashboard check-all, wake re-probe) still probe: explicit
 // operator intent wins over pacing. A later successful validation clears the
 // mark; validation that never ran leaves no mark.
-const validationRateLimitedAt = new Map<number, number>();
+const validationRateLimitedAt = new Map<string, number>();
 
 const DEFAULT_VALIDATION_RATE_LIMIT_SKIP_MS = 60 * 60 * 1000;
 
@@ -167,7 +169,7 @@ function getValidationRateLimitSkipMs(): number {
 /** Record that validating this key was just rate-limited. Exported for tests;
  *  production calls it from checkKeyHealth's 429 path. */
 export function recordValidationRateLimited(keyId: number, atMs = Date.now()): void {
-  validationRateLimitedAt.set(keyId, atMs);
+  validationRateLimitedAt.set(scopedKey(keyId), atMs);
 }
 
 /** Test seam: drop all validation-429 pacing state. */
@@ -176,8 +178,9 @@ export function clearValidationRateLimitState(): void {
 }
 
 function recordInvalidFailure(keyId: number, platform?: string): void {
-  const count = (failureCount.get(keyId) ?? 0) + 1;
-  failureCount.set(keyId, count);
+  const key = scopedKey(keyId);
+  const count = (failureCount.get(key) ?? 0) + 1;
+  failureCount.set(key, count);
 
   if (count >= CONSECUTIVE_FAILURES_TO_DISABLE) {
     getDb().prepare('UPDATE api_keys SET enabled = 0 WHERE id = ?').run(keyId);
@@ -266,6 +269,7 @@ export async function maybePollKeyQuota(keyId: number): Promise<boolean> {
 
 export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
   const db = getDb();
+  const key = scopedKey(keyId);
   const row = db.prepare('SELECT * FROM api_keys WHERE id = ?').get(keyId) as any;
   if (!row) return 'error';
 
@@ -315,13 +319,13 @@ export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
       .run(status, lastError, keyId);
 
     if (isValid) {
-      failureCount.delete(keyId);
+      failureCount.delete(key);
       // #1510: the provider answered — whatever unreachable streak this key had
       // is over, so the transport counter starts from zero again.
-      transportFailures.delete(keyId);
+      transportFailures.delete(key);
       // The provider answered again: whatever rate-limit told us to back off
       // is over, so the key rejoins the normal cadence.
-      validationRateLimitedAt.delete(keyId);
+      validationRateLimitedAt.delete(key);
       // #1348: a healthy key on a built-in platform the catalog does not carry
       // serves nothing until its models are discovered. Fire-and-forget; the
       // trigger is a no-op for every other platform, and throttled.
@@ -377,7 +381,7 @@ export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
     // proof the provider is reachable, so it counts as a break in the streak,
     // not an increment.
     let parked = false;
-    if (err?.status === 429) transportFailures.delete(keyId);
+    if (err?.status === 429) transportFailures.delete(scopedKey(keyId));
     else parked = recordTransportFailure(keyId, row.platform);
     db.prepare("UPDATE api_keys SET last_health_error = ?, last_checked_at = datetime('now') WHERE id = ?")
       .run(lastError, keyId);
@@ -436,7 +440,7 @@ export async function probeKeyValidity(keyId: number): Promise<KeyProbeOutcome> 
  * would put a DB write on the hot path. One stamp per key per minute is plenty
  * for "last worked N ago".
  */
-const lastHealthyStampedAt = new Map<number, number>();
+const lastHealthyStampedAt = new Map<string, number>();
 const LAST_HEALTHY_STAMP_INTERVAL_MS = 60_000;
 
 /** Test seam: drop the stamp throttle so a test can observe consecutive writes. */
@@ -462,9 +466,10 @@ export function markKeyHealthyFromRequest(keyId: number): void {
     // success signal for providers with supportsKeyValidation === false (#1459),
     // which never get a probe. Throttled in memory, not per request.
     const now = Date.now();
-    const lastStamp = lastHealthyStampedAt.get(keyId);
+    const cacheKey = scopedKey(keyId);
+    const lastStamp = lastHealthyStampedAt.get(cacheKey);
     if (lastStamp === undefined || now - lastStamp >= LAST_HEALTHY_STAMP_INTERVAL_MS) {
-      lastHealthyStampedAt.set(keyId, now);
+      lastHealthyStampedAt.set(cacheKey, now);
       getDb()
         .prepare("UPDATE api_keys SET last_healthy_at = datetime('now') WHERE id = ?")
         .run(keyId);
@@ -472,10 +477,10 @@ export function markKeyHealthyFromRequest(keyId: number): void {
     getDb()
       .prepare("UPDATE api_keys SET status = 'healthy', last_health_error = NULL WHERE id = ? AND status IN ('error', 'unknown')")
       .run(keyId);
-    failureCount.delete(keyId);
+    failureCount.delete(scopedKey(keyId));
     // #1510: a served request is the strongest reachability evidence there is —
     // it also ends any transport-error streak, parked or not.
-    transportFailures.delete(keyId);
+    transportFailures.delete(scopedKey(keyId));
   } catch {
     // Never let health bookkeeping break a request that already succeeded.
   }
@@ -600,7 +605,7 @@ async function runHealthPass(opts: HealthPassOptions): Promise<HealthPassResult>
     // A key the provider just rate-limited stays out until the skip window
     // passes — even one parked at 'error'. A 429 is fresher, more specific
     // evidence than the eagerness to re-ask an errored key (#1369).
-    const limitedAt = validationRateLimitedAt.get(row.id);
+    const limitedAt = validationRateLimitedAt.get(scopedKey(row.id));
     if (limitedAt !== undefined && now() - limitedAt < skipMs) {
       skippedKeyIds.push(row.id);
       return false;

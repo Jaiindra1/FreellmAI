@@ -36,6 +36,7 @@ import { urlTokenRouter } from './routes/url-tokens.js';
 import { updateRouter } from './routes/update.js';
 import { moderationRouter } from './routes/moderation.js';
 import { requireAuth } from './middleware/requireAuth.js';
+import { proxyWorkspace } from './middleware/proxyWorkspace.js';
 import { createProxyRateLimiter, createAdminRateLimiter } from './middleware/rateLimit.js';
 
 // Password-guess ceiling for GET /api/keys/export. Deliberately low: a real
@@ -285,6 +286,10 @@ export function createApp(config?: Config) {
   // are always reachable and don't draw down a caller's request budget. It only
   // owns those two paths; everything else falls through to the routers below.
   app.use('/v1', docsRouter);
+
+  // Resolve API and URL credentials to their owning isolated workspace before
+  // any proxy route reads keys, routing settings, usage, or cached responses.
+  app.use(proxyWorkspace);
 
   // Read-only per-upstream status for meta-gateways (GET /v1/providers, #433).
   // Unified-key auth is enforced inside the handler; mounted before the rate

@@ -1,11 +1,18 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
-import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
+import { initDb, getDb, getAuthDb, getUnifiedApiKey, runInWorkspace } from '../../db/index.js';
 import { clearCache } from '../../services/cache.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 
 let dashToken = '';
+
+function clearTestWorkspaceCache() {
+  const user = getAuthDb().prepare('SELECT id FROM users WHERE email = ?')
+    .get('test@example.com') as { id: number } | undefined;
+  if (user) runInWorkspace(user.id, () => clearCache());
+  else clearCache();
+}
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
   const server = app.listen(0, '127.0.0.1');
@@ -109,14 +116,14 @@ describe('Response cache (proxy integration)', () => {
     db.prepare('DELETE FROM api_keys').run();
     db.prepare('DELETE FROM requests').run();
     db.prepare('DELETE FROM rate_limit_usage').run();
-    clearCache();
+    clearTestWorkspaceCache();
     const addKey = await request(app, 'POST', '/api/keys', { platform: 'groq', key: 'gsk_cache_test', label: 'cache' });
     expect(addKey.status).toBe(201);
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
-    clearCache();
+    clearTestWorkspaceCache();
   });
 
   const chat = (extra: Record<string, unknown> = {}, headers: Record<string, string> = {}) =>

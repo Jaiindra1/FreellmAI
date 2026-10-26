@@ -58,6 +58,7 @@ function Centered({ children }: { children: ReactNode }) {
 
 function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () => void }) {
   const { t } = useI18n()
+  const [flow, setFlow] = useState<'setup' | 'login' | 'signup'>(mode)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [setupCode, setSetupCode] = useState('')
@@ -69,22 +70,22 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
   const [attempted, setAttempted] = useState(false)
   const [showForgot, setShowForgot] = useState(false)
 
-  const isSetup = mode === 'setup'
+  const isSetup = flow === 'setup'
+  const isRegistration = flow !== 'login'
 
-  // Inline field feedback; the server stays authoritative. Only the setup form
-  // enforces the password minimum client-side (an existing password of any
-  // length must still be able to log in). The same goes for the email shape:
-  // the desktop app's hidden account is `desktop@localhost` (no TLD), which
-  // the login route accepts on purpose (server/src/routes/auth.ts), so a
-  // browser tab must be able to submit it after a password reset (#1250).
+  // Inline field feedback; the server stays authoritative. Registration
+  // enforces the password minimum; existing passwords of any length must
+  // still be able to log in. The same goes for email shape: the desktop app's
+  // hidden account is `desktop@localhost` (no TLD), which the login route
+  // accepts on purpose (server/src/routes/auth.ts) (#1250).
   const emailError = !email.trim()
     ? t('validation.required')
-    : isSetup && !isEmail(email)
+    : isRegistration && !isEmail(email)
       ? t('validation.email')
       : null
   const passwordError = !password
     ? t('validation.required')
-    : isSetup && password.length < PASSWORD_MIN
+    : isRegistration && password.length < PASSWORD_MIN
       ? t('validation.passwordMin', { min: PASSWORD_MIN })
       : null
 
@@ -104,7 +105,12 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
       // Only the setup flow carries a code, and only once the server has asked
       // for it. The server ignores it for local (loopback) setup.
       if (isSetup && setupCode) payload.setupCode = setupCode.trim()
-      const res = await apiFetch<{ token: string }>(isSetup ? '/api/auth/setup' : '/api/auth/login', {
+      const endpoint = isSetup
+        ? '/api/auth/setup'
+        : flow === 'signup'
+          ? '/api/auth/register'
+          : '/api/auth/login'
+      const res = await apiFetch<{ token: string }>(endpoint, {
         method: 'POST',
         body: JSON.stringify(payload),
       })
@@ -122,8 +128,8 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
     }
   }
 
-  if (showForgot && !isSetup) {
-    return <ForgotPasswordForm onBack={() => setShowForgot(false)} onAuthed={onAuthed} />
+  if (showForgot && !isRegistration) {
+    return <ForgotPasswordForm initialEmail={email} onBack={() => setShowForgot(false)} onAuthed={onAuthed} />
   }
 
   return (
@@ -133,9 +139,9 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
         <span className="font-semibold tracking-tight text-sm">FreeLLMAPI</span>
       </div>
       <div className="rounded-3xl border bg-card p-6">
-        <h1 className="text-lg font-semibold tracking-tight">{isSetup ? t('auth.createYourAccount') : t('auth.signIn')}</h1>
+        <h1 className="text-lg font-semibold tracking-tight">{isRegistration ? t('auth.createYourAccount') : t('auth.signIn')}</h1>
         <p className="text-sm text-muted-foreground mt-1.5 mb-6">
-          {isSetup
+          {isRegistration
             ? t('auth.setupDescription')
             : t('auth.loginDescription')}
         </p>
@@ -160,10 +166,10 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
             <Input
               id="auth-password"
               type="password"
-              autoComplete={isSetup ? 'new-password' : 'current-password'}
+              autoComplete={isRegistration ? 'new-password' : 'current-password'}
               value={password}
               onChange={e => setPassword(e.target.value)}
-              placeholder={isSetup ? t('auth.passwordPlaceholderSetup') : t('auth.passwordPlaceholderLogin')}
+              placeholder={isRegistration ? t('auth.passwordPlaceholderSetup') : t('auth.passwordPlaceholderLogin')}
               aria-invalid={showPasswordError}
               aria-describedby={showPasswordError ? 'auth-password-error' : undefined}
             />
@@ -193,10 +199,28 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
           )}
           <Button type="submit" className="w-full h-10" disabled={busy}>
             {busy && <Loader2 className="animate-spin" aria-hidden />}
-            {busy ? (isSetup ? t('auth.creating') : t('auth.signingIn')) : isSetup ? t('auth.createAccount') : t('auth.signIn')}
+            {busy ? (isRegistration ? t('auth.creating') : t('auth.signingIn')) : isRegistration ? t('auth.createAccount') : t('auth.signIn')}
           </Button>
         </form>
-        {!isSetup && (
+        {flow === 'login' && (
+          <button
+            type="button"
+            onClick={() => setFlow('signup')}
+            className="mt-3 w-full text-center text-xs text-muted-foreground hover:text-foreground transition-colors"
+          >
+            {t('auth.createAccount')}
+          </button>
+        )}
+        {flow === 'signup' && (
+          <button
+            type="button"
+            onClick={() => setFlow('login')}
+            className="mt-3 w-full text-center text-xs text-muted-foreground hover:text-foreground transition-colors"
+          >
+            {t('auth.backToLogin')}
+          </button>
+        )}
+        {!isRegistration && (
           <button
             type="button"
             onClick={() => setShowForgot(true)}
@@ -214,15 +238,21 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
 
 type ForgotStep = 'request' | 'reset' | 'done'
 
-function ForgotPasswordForm({ onBack, onAuthed }: { onBack: () => void; onAuthed: () => void }) {
+function ForgotPasswordForm({ initialEmail, onBack, onAuthed }: { initialEmail: string; onBack: () => void; onAuthed: () => void }) {
   const { t } = useI18n()
   const [step, setStep] = useState<ForgotStep>('request')
+  const [email, setEmail] = useState(initialEmail)
   const [resetCode, setResetCode] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [attempted, setAttempted] = useState(false)
 
+  const emailError = !email.trim()
+    ? t('validation.required')
+    : !isEmail(email)
+      ? t('validation.email')
+      : null
   const passwordError = !newPassword
     ? t('validation.required')
     : newPassword.length < PASSWORD_MIN
@@ -231,10 +261,17 @@ function ForgotPasswordForm({ onBack, onAuthed }: { onBack: () => void; onAuthed
   const codeError = !resetCode.trim() ? t('validation.required') : null
 
   async function requestCode() {
+    if (emailError) {
+      setAttempted(true)
+      return
+    }
     setBusy(true)
     setError('')
     try {
-      await apiFetch('/api/auth/forgot-password', { method: 'POST' })
+      await apiFetch('/api/auth/forgot-password', {
+        method: 'POST',
+        body: JSON.stringify({ email: email.trim() }),
+      })
       setStep('reset')
     } catch (err) {
       setError((err as Error).message)
@@ -281,13 +318,33 @@ function ForgotPasswordForm({ onBack, onAuthed }: { onBack: () => void; onAuthed
         <h1 className="text-base font-medium">{t('auth.forgotPassword')}</h1>
 
         {step === 'request' && (
-          <div className="mt-1 space-y-3">
+          <form
+            className="mt-1 space-y-3"
+            onSubmit={e => {
+              e.preventDefault()
+              void requestCode()
+            }}
+            noValidate
+          >
             <p className="text-xs text-muted-foreground mb-4">{t('auth.forgotPasswordDescription')}</p>
+            <div className="space-y-1.5">
+              <Label className="text-xs" htmlFor="forgot-email">{t('auth.email')}</Label>
+              <Input
+                id="forgot-email"
+                type="email"
+                autoComplete="username"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                aria-invalid={attempted && !!emailError}
+                aria-describedby={attempted && emailError ? 'forgot-email-error' : undefined}
+              />
+              {attempted && <FieldError id="forgot-email-error" error={emailError} />}
+            </div>
             {error && <p className="text-destructive text-xs">{error}</p>}
-            <Button className="w-full" disabled={busy} onClick={requestCode}>
+            <Button type="submit" className="w-full" disabled={busy}>
               {busy ? t('auth.requestingResetCode') : t('auth.requestResetCode')}
             </Button>
-          </div>
+          </form>
         )}
 
         {step === 'reset' && (
@@ -539,4 +596,3 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   return <>{children}</>
 }
-

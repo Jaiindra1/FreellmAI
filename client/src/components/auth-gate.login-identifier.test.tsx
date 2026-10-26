@@ -55,6 +55,12 @@ async function submit() {
   await flush()
 }
 
+async function clickButton(label: string) {
+  const button = [...container.querySelectorAll('button')].find(b => b.textContent === label)!
+  act(() => { button.click() })
+  await flush()
+}
+
 beforeAll(() => {
   ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 })
@@ -117,5 +123,18 @@ describe('AuthGate login identifier', () => {
 
     expect(posts).toHaveLength(0)
     expect(container.querySelector('#auth-email-error')?.textContent).toContain('valid email')
+  })
+
+  it('offers signup from the login screen and submits without a setup code', async () => {
+    mount()
+    await flush()
+    await clickButton('Create account')
+    type('#auth-email', 'friend@example.com')
+    type('#auth-password', 'a-long-enough-password')
+    await submit()
+
+    expect(posts).toHaveLength(1)
+    expect(posts[0].url.endsWith('/api/auth/register')).toBe(true)
+    expect(posts[0].body).toEqual({ email: 'friend@example.com', password: 'a-long-enough-password' })
   })
 })

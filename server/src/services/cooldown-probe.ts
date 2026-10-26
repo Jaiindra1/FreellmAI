@@ -29,6 +29,7 @@
 // CATALOG_SYNC_DISABLED). Per-pass probe budget: COOLDOWN_PROBE_MAX_PER_PASS.
 
 import type { Scheduler } from '../lib/scheduler.js';
+import { getWorkspaceScope } from '../db/index.js';
 import {
   getProbeableCooldowns,
   clearCooldownEarly,
@@ -82,7 +83,11 @@ interface KeyProbeState {
 // keyId -> probe pacing. In-memory only, like the escalation ladder: a restart
 // forgetting the backoff is fine because first-sighting staggering re-spaces
 // the probes anyway.
-const keyState = new Map<number, KeyProbeState>();
+const keyState = new Map<string, KeyProbeState>();
+
+function scopedKey(keyId: number): string {
+  return `${getWorkspaceScope()}:${keyId}`;
+}
 
 export interface ProbePassOptions {
   now?: number;
@@ -124,32 +129,34 @@ export async function runCooldownProbePass(opts: ProbePassOptions = {}): Promise
   // Drop pacing state for keys with no probeable cooldowns left (expired,
   // cleared, or re-benched as authoritative) so old backoff cannot delay a
   // future, unrelated bench.
-  const keysWithCooldowns = new Set(all.map(c => c.keyId));
+  const keysWithCooldowns = new Set(all.map(c => scopedKey(c.keyId)));
   for (const keyId of [...keyState.keys()]) {
     if (!keysWithCooldowns.has(keyId)) keyState.delete(keyId);
   }
 
-  const ripeByKey = new Map<number, ProbeableCooldown[]>();
+  const ripeByKey = new Map<string, ProbeableCooldown[]>();
   for (const cooldown of all) {
     if (!isRipe(cooldown, now)) continue;
-    const list = ripeByKey.get(cooldown.keyId) ?? [];
+    const key = scopedKey(cooldown.keyId);
+    const list = ripeByKey.get(key) ?? [];
     list.push(cooldown);
-    ripeByKey.set(cooldown.keyId, list);
+    ripeByKey.set(key, list);
   }
 
   const probedKeyIds: number[] = [];
   let clearedCooldowns = 0;
 
-  for (const [keyId, cooldownsForKey] of ripeByKey) {
+  for (const [pacedKey, cooldownsForKey] of ripeByKey) {
     if (probedKeyIds.length >= maxProbes) break;
+    const keyId = cooldownsForKey[0]!.keyId;
 
-    let state = keyState.get(keyId);
+    let state = keyState.get(pacedKey);
     if (!state) {
       // First sighting: schedule, don't probe. This is the restart stagger —
       // a boot with dozens of persisted cooldowns spreads its first probes
       // across the jitter window instead of validating everything at once.
       state = { failures: 0, nextProbeAtMs: now + Math.floor(jitter() * FIRST_PROBE_STAGGER_MS) };
-      keyState.set(keyId, state);
+      keyState.set(pacedKey, state);
       continue;
     }
     if (now < state.nextProbeAtMs) continue;
@@ -162,7 +169,7 @@ export async function runCooldownProbePass(opts: ProbePassOptions = {}): Promise
         clearCooldownEarly(cooldown.platform, cooldown.modelId, cooldown.keyId);
         clearedCooldowns++;
       }
-      keyState.delete(keyId);
+      keyState.delete(pacedKey);
       // Structured so the dashboard log viewer can filter recoveries by
       // provider; providerLog still writes the same line to stdout.
       providerLog(
@@ -186,14 +193,17 @@ export async function runCooldownProbePass(opts: ProbePassOptions = {}): Promise
 
 // Overlap guard, same shape as checkAllKeys: a slow provider validate must not
 // let the next scheduled pass stack a second set of probes on top.
-let passInFlight: Promise<ProbePassResult> | null = null;
+const passInFlight = new Map<string, Promise<ProbePassResult>>();
 
 function runGuardedPass(): Promise<ProbePassResult> {
-  if (passInFlight) return passInFlight;
-  passInFlight = runCooldownProbePass().finally(() => {
-    passInFlight = null;
+  const scope = getWorkspaceScope();
+  const pending = passInFlight.get(scope);
+  if (pending) return pending;
+  const run = runCooldownProbePass().finally(() => {
+    passInFlight.delete(scope);
   });
-  return passInFlight;
+  passInFlight.set(scope, run);
+  return run;
 }
 
 let cancelProbeJob: (() => void) | null = null;

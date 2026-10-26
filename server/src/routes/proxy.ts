@@ -12,7 +12,7 @@ import { runDecision, DecisionError, decisionRetryAfterSec, listDecisionModels, 
 import { retryAfterSeconds } from '../lib/retry-hint.js';
 import { runImageGeneration, runVideoGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSCRIPTION_BYTES } from '../services/media.js';
 import multer from 'multer';
-import { getDb } from '../db/index.js';
+import { getDb, getWorkspaceScope } from '../db/index.js';
 import { resolveAuth, prependSystemPrompt, type ResolvedAuth } from '../lib/system-prompt.js';
 import { contentToString, estimateInputTokens, messageHasImage, normalizeOutboundContent, sanitizeResponse } from '../lib/content.js';
 import { routeOutputBudget } from '../lib/output-cap.js';
@@ -258,16 +258,18 @@ function restoreSessionReasoning(messages: ChatMessage[], reasoning: string, pla
 }
 
 function getSessionKey(messages: ChatMessage[], sessionIdHeader?: string, strategyKey?: string): string {
+  let key: string;
   if (sessionIdHeader) {
-    return strategyKey ? `hdr:${sessionIdHeader}::${strategyKey}` : `hdr:${sessionIdHeader}`;
+    key = strategyKey ? `hdr:${sessionIdHeader}::${strategyKey}` : `hdr:${sessionIdHeader}`;
+  } else {
+    const firstUser = messages.find(m => m.role === 'user');
+    if (!firstUser) return '';
+    const text = contentToString(firstUser.content ?? '');
+    if (!text) return '';
+    const payload = strategyKey ? `${text}::${strategyKey}` : text;
+    key = crypto.createHash('sha1').update(payload).digest('hex');
   }
-
-  const firstUser = messages.find(m => m.role === 'user');
-  if (!firstUser) return '';
-  const text = contentToString(firstUser.content ?? '');
-  if (!text) return '';
-  const payload = strategyKey ? `${text}::${strategyKey}` : text;
-  return crypto.createHash('sha1').update(payload).digest('hex');
+  return `${getWorkspaceScope()}:${key}`;
 }
 
 export function getStickyModel(messages: ChatMessage[], sessionIdHeader?: string, strategyKey?: string): number | undefined {

@@ -36,7 +36,8 @@
 //     throwing in the proxy hot path (mirrors services/ratelimit.ts).
 
 import crypto from 'crypto';
-import { getSetting, getDb } from '../db/index.js';
+import { getSetting, getDb, getAuthDb, getWorkspaceScope } from '../db/index.js';
+import type { Db } from '../db/types.js';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
 
 // ── Config (read on each call so tests and the dashboard can toggle live) ──
@@ -198,8 +199,9 @@ function normModel(model: string | undefined): string {
 }
 
 export function computeCacheKey(input: CacheKeyInput): string {
+  const workspace = getWorkspaceScope();
   const canonical = stableStringify({
-    v: 4, // explicit-but-default-valued sampling params dropped from the key
+    v: 5, // explicit defaults are normalized; responses are private to their workspace
     model: normModel(input.model),
     messages: input.messages,
     temperature: input.temperature,
@@ -225,7 +227,7 @@ export function computeCacheKey(input: CacheKeyInput): string {
     reasoning_effort: input.reasoning_effort,
     compression: input.compression,
   });
-  return crypto.createHash('sha256').update(canonical).digest('hex');
+  return `${workspace}:${crypto.createHash('sha256').update(canonical).digest('hex')}`;
 }
 
 // Normalizes a sampling param that was passed explicitly but equals the API
@@ -343,8 +345,15 @@ function enforceCombinedCap(): void {
 // is only honest when numerator and denominator cover the same window, and
 // that window is this process. The savings figures below are the ones that
 // survive a restart, because they ride on the entries themselves.
-let lookupHits = 0;
-let lookupMisses = 0;
+let lookupCounts = new Map<string, { hits: number; misses: number }>();
+
+function countLookup(hit: boolean): void {
+  const scope = getWorkspaceScope();
+  const counts = lookupCounts.get(scope) ?? { hits: 0, misses: 0 };
+  if (hit) counts.hits++;
+  else counts.misses++;
+  lookupCounts.set(scope, counts);
+}
 
 // ── Deferred SQLite write-through ──
 // better-sqlite3 is synchronous, so a store/hit write would sit on the request
@@ -353,12 +362,12 @@ let lookupMisses = 0;
 // in-memory map is already correct by then, and a crash in the gap only costs
 // a cache entry. Individually wrapped so one bad write cannot take down the
 // drain, and skipped entirely when persistence is off.
-const pendingWrites: Array<() => void> = [];
+const pendingWrites: Array<{ db: Db; op: (db: Db) => void }> = [];
 let drainScheduled = false;
 
-function schedulePersist(op: () => void): void {
+function schedulePersist(op: (db: Db) => void, db = getDb()): void {
   if (!cachePersistenceEnabled()) return;
-  pendingWrites.push(op);
+  pendingWrites.push({ db, op });
   if (drainScheduled) return;
   drainScheduled = true;
   setImmediate(drainPendingWrites);
@@ -367,9 +376,9 @@ function schedulePersist(op: () => void): void {
 function drainPendingWrites(): void {
   drainScheduled = false;
   const ops = pendingWrites.splice(0, pendingWrites.length);
-  for (const op of ops) {
+  for (const { db, op } of ops) {
     try {
-      op();
+      op(db);
     } catch {
       // best-effort: a DB failure degrades to memory-only, never to a 500
     }
@@ -377,8 +386,8 @@ function drainPendingWrites(): void {
 }
 
 function scheduleRowDelete(cacheKey: string): void {
-  schedulePersist(() => {
-    getDb().prepare('DELETE FROM response_cache WHERE cache_key = ?').run(cacheKey);
+  schedulePersist(db => {
+    db.prepare('DELETE FROM response_cache WHERE cache_key = ?').run(cacheKey);
   });
 }
 
@@ -387,27 +396,31 @@ function scheduleRowDelete(cacheKey: string): void {
 // A pending count belongs to the entry that earned it: clearCache() and a
 // re-store both drop it, so a stale count is never flushed onto a fresh row.
 const HIT_FLUSH_DELAY_MS = 2_000;
-const dirtyHitCounts = new Map<string, { hitCount: number; lastHitAtMs: number }>();
-let hitFlushTimer: NodeJS.Timeout | undefined;
+let dirtyHitCounts = new Map<Db, Map<string, { hitCount: number; lastHitAtMs: number }>>();
+let hitFlushTimers = new Map<Db, NodeJS.Timeout>();
 function scheduleHitCountFlush(): void {
-  if (hitFlushTimer) return;
-  hitFlushTimer = setTimeout(() => {
-    hitFlushTimer = undefined;
-    if (dirtyHitCounts.size === 0) return;
-    const batch = new Map(dirtyHitCounts);
-    dirtyHitCounts.clear();
-    schedulePersist(() => {
-      const stmt = getDb().prepare('UPDATE response_cache SET hit_count = ?, last_hit_at_ms = ? WHERE cache_key = ?');
+  const db = getDb();
+  if (hitFlushTimers.has(db)) return;
+  const dirty = dirtyHitCounts.get(db) ?? new Map();
+  dirtyHitCounts.set(db, dirty);
+  hitFlushTimers.set(db, setTimeout(() => {
+    hitFlushTimers.delete(db);
+    if (dirty.size === 0) return;
+    const batch = new Map(dirty);
+    dirty.clear();
+    schedulePersist(db => {
+      const stmt = db.prepare('UPDATE response_cache SET hit_count = ?, last_hit_at_ms = ? WHERE cache_key = ?');
       for (const [cacheKey, hit] of batch) stmt.run(hit.hitCount, hit.lastHitAtMs, cacheKey);
-    });
-  }, HIT_FLUSH_DELAY_MS);
-  hitFlushTimer.unref();
+    }, db);
+  }, HIT_FLUSH_DELAY_MS));
+  hitFlushTimers.get(db)!.unref();
 }
 
-function dropPendingHitCounts(): void {
-  dirtyHitCounts.clear();
-  if (hitFlushTimer) clearTimeout(hitFlushTimer);
-  hitFlushTimer = undefined;
+function dropPendingHitCounts(db = getDb()): void {
+  dirtyHitCounts.get(db)?.clear();
+  const timer = hitFlushTimers.get(db);
+  if (timer) clearTimeout(timer);
+  hitFlushTimers.delete(db);
 }
 
 /**
@@ -429,8 +442,10 @@ export function __resetMemoryForTests(): void {
   drainPendingWrites();
   store.clear();
   streamStore.clear();
-  lookupHits = 0;
-  lookupMisses = 0;
+  lookupCounts = new Map();
+  dirtyHitCounts = new Map();
+  for (const timer of hitFlushTimers.values()) clearTimeout(timer);
+  hitFlushTimers = new Map();
 }
 
 /**
@@ -441,7 +456,7 @@ export function __resetMemoryForTests(): void {
 export function getCachedResponse(cacheKey: string, now = Date.now()): CachedResponse | null {
   const entry = store.get(cacheKey);
   if (!entry) {
-    lookupMisses += 1;
+    countLookup(false);
     return null;
   }
 
@@ -449,11 +464,11 @@ export function getCachedResponse(cacheKey: string, now = Date.now()): CachedRes
     store.delete(cacheKey);
     // The row would otherwise outlive its memory entry until the next restart.
     scheduleRowDelete(cacheKey);
-    lookupMisses += 1;
+    countLookup(false);
     return null;
   }
 
-  lookupHits += 1;
+  countLookup(true);
   entry.hitCount += 1;
   entry.lastHitAtMs = now;
   // Move to most-recently-used.
@@ -464,7 +479,10 @@ export function getCachedResponse(cacheKey: string, now = Date.now()): CachedRes
   // restart instead of resetting to whatever the last store wrote. Hits are
   // batched: one debounced UPDATE for all keys dirtied in the window, instead
   // of one queued UPDATE per hit (a hot entry used to write on every hit).
-  dirtyHitCounts.set(cacheKey, { hitCount: entry.hitCount, lastHitAtMs: now });
+  const db = getDb();
+  const dirty = dirtyHitCounts.get(db) ?? new Map();
+  dirty.set(cacheKey, { hitCount: entry.hitCount, lastHitAtMs: now });
+  dirtyHitCounts.set(db, dirty);
   scheduleHitCountFlush();
 
   return {
@@ -502,7 +520,7 @@ export function storeCachedResponse(cacheKey: string, input: StoreInput, now = D
   // Delete-then-set so an overwrite also refreshes recency order. Any hits
   // still waiting to be flushed counted the old answer, not this one.
   store.delete(cacheKey);
-  dirtyHitCounts.delete(cacheKey);
+  dirtyHitCounts.get(getDb())?.delete(cacheKey);
   store.set(cacheKey, {
     body: input.body,
     platform: input.platform,
@@ -526,8 +544,8 @@ export function storeCachedResponse(cacheKey: string, input: StoreInput, now = D
   const entry = store.get(cacheKey);
   if (!entry) return; // cap of 0: the entry was evicted by the loop above
   const expiresAtMs = now + cacheTtlMs();
-  schedulePersist(() => {
-    getDb().prepare(
+  schedulePersist(db => {
+    db.prepare(
       `INSERT INTO response_cache
          (cache_key, body_json, platform, model_id, key_id, prompt_tokens, completion_tokens, hit_count, created_at_ms, last_hit_at_ms, expires_at_ms)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -656,17 +674,17 @@ export interface StoreStreamInput {
 export function getCachedStreamResponse(cacheKey: string, now = Date.now()): CachedStreamResponse | null {
   const entry = streamStore.get(cacheKey);
   if (!entry) {
-    lookupMisses += 1;
+    countLookup(false);
     return null;
   }
 
   if (now - entry.createdAtMs > cacheTtlMs()) {
     streamStore.delete(cacheKey);
-    lookupMisses += 1;
+    countLookup(false);
     return null;
   }
 
-  lookupHits += 1;
+  countLookup(true);
   entry.hitCount += 1;
   entry.lastHitAtMs = now;
   streamStore.delete(cacheKey);
@@ -745,29 +763,39 @@ export interface CacheStats {
  * and drag the reported rate down forever.
  */
 export function getCacheStats(): CacheStats {
+  const scope = getWorkspaceScope();
+  const prefix = `${scope}:`;
+  const includeLegacyRows = getDb() === getAuthDb();
   let totalHits = 0;
   let savedPromptTokens = 0;
   let savedCompletionTokens = 0;
-  for (const entry of store.values()) {
+  let entries = 0;
+  const belongsToScope = (key: string) => key.startsWith(prefix) || (includeLegacyRows && !key.includes(':'));
+  for (const [key, entry] of store) {
+    if (!belongsToScope(key)) continue;
+    entries++;
     totalHits += entry.hitCount;
     savedPromptTokens += entry.hitCount * entry.promptTokens;
     savedCompletionTokens += entry.hitCount * entry.completionTokens;
   }
-  for (const entry of streamStore.values()) {
+  for (const [key, entry] of streamStore) {
+    if (!belongsToScope(key)) continue;
+    entries++;
     totalHits += entry.hitCount;
     savedPromptTokens += entry.hitCount * entry.promptTokens;
     savedCompletionTokens += entry.hitCount * entry.completionTokens;
   }
-  const lookups = lookupHits + lookupMisses;
+  const lookups = lookupCounts.get(scope) ?? { hits: 0, misses: 0 };
+  const lookupTotal = lookups.hits + lookups.misses;
   return {
-    entries: store.size + streamStore.size,
+    entries,
     totalHits,
     estimatedRequestsSaved: totalHits,
     savedPromptTokens,
     savedCompletionTokens,
-    lookupHits,
-    lookupMisses,
-    hitRate: lookups > 0 ? lookupHits / lookups : 0,
+    lookupHits: lookups.hits,
+    lookupMisses: lookups.misses,
+    hitRate: lookupTotal > 0 ? lookups.hits / lookupTotal : 0,
   };
 }
 
@@ -780,17 +808,33 @@ export function getCacheStats(): CacheStats {
  * rather than deferred: this is an admin route, not the proxy hot path.
  */
 export function clearCache(): number {
-  const removed = store.size + streamStore.size;
-  store.clear();
-  streamStore.clear();
-  pendingWrites.length = 0;
-  dropPendingHitCounts();
+  const db = getDb();
+  const scope = getWorkspaceScope();
+  const prefix = `${scope}:`;
+  const includeLegacyRows = db === getAuthDb();
+  const belongsToScope = (key: string) => key.startsWith(prefix) || (includeLegacyRows && !key.includes(':'));
+  let removed = 0;
+  for (const key of store.keys()) {
+    if (belongsToScope(key)) {
+      store.delete(key);
+      removed++;
+    }
+  }
+  for (const key of streamStore.keys()) {
+    if (belongsToScope(key)) {
+      streamStore.delete(key);
+      removed++;
+    }
+  }
+  for (let i = pendingWrites.length - 1; i >= 0; i--) {
+    if (pendingWrites[i]!.db === db) pendingWrites.splice(i, 1);
+  }
+  dropPendingHitCounts(db);
   // The lookup tallies describe the cache that just went away; keeping them
   // would show a 90% hit rate next to zero entries right after a flush.
-  lookupHits = 0;
-  lookupMisses = 0;
+  lookupCounts.set(scope, { hits: 0, misses: 0 });
   try {
-    getDb().prepare('DELETE FROM response_cache').run();
+    db.prepare('DELETE FROM response_cache').run();
   } catch {
     // best-effort: no DB (or no table yet) means there is nothing persisted
   }

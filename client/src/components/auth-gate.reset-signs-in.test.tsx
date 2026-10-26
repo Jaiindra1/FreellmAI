@@ -60,6 +60,7 @@ async function resetWithCode() {
   mount()
   await flush()
   await clickButton('Forgot password?')
+  type('#forgot-email', 'owner@example.test')
   await clickButton('Send reset code')
   type('#reset-code', 'ABCDEFGHIJ')
   type('#reset-new-password', 'brand-new-password')
@@ -108,6 +109,7 @@ describe('AuthGate password reset', () => {
     await resetWithCode()
 
     expect(posts.map(p => p.url.replace(/^.*\/api/, '/api'))).toEqual(['/api/auth/forgot-password', '/api/auth/reset-password'])
+    expect(posts[0].body).toEqual({ email: 'owner@example.test' })
     expect(posts[1].body).toEqual({ resetCode: 'ABCDEFGHIJ', newPassword: 'brand-new-password' })
     expect(getToken()).toBe('session-after-reset')
     expect(container.querySelector('[data-testid="app"]')).not.toBeNull()

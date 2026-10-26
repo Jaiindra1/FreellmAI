@@ -10,6 +10,7 @@ import { createOneTimeCode } from './one-time-code.js';
 const _code = createOneTimeCode();
 const RESET_CODE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 let mintedAtMs = 0;
+let resetEmail: string | null = null;
 
 // Mint a fresh reset code and log it prominently, with the account email: the
 // operator who forgot the password may have forgotten which email signs in
@@ -18,6 +19,7 @@ let mintedAtMs = 0;
 export function generateResetCode(accountEmail?: string | null): string {
   const code = _code.generate();
   mintedAtMs = Date.now();
+  resetEmail = accountEmail?.trim().toLowerCase() || null;
   console.log('');
   console.log('  Password-reset code: ' + code);
   if (accountEmail) console.log('  Account email: ' + accountEmail);
@@ -33,6 +35,11 @@ export function getResetCode(): string | null {
 export function clearResetCode(): void {
   _code.clear();
   mintedAtMs = 0;
+  resetEmail = null;
+}
+
+export function getResetCodeEmail(): string | null {
+  return resetEmail;
 }
 
 // Constant-time comparison against the active code. Returns false when no code

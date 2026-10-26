@@ -13,7 +13,7 @@
 // the user can switch the model back on, and a catalog refresh that still lists
 // it lifts the retirement (services/catalog-sync.ts).
 
-import { getDb } from '../db/index.js';
+import { getDb, getWorkspaceScope } from '../db/index.js';
 import { modelRetirementSignal } from '../lib/error-classify.js';
 import { summarizeAttemptError } from '../lib/error-redaction.js';
 import { isCatalogManagedModel, retireCatalogModelUpstream } from './model-state.js';
@@ -71,7 +71,7 @@ export function noteModelRetirementSignal(
   const confidence = modelRetirementSignal(err);
   if (!confidence) return false;
 
-  const key = modelStatsKey(route.platform, route.modelId, route.endpointScope);
+  const key = `${getWorkspaceScope()}:${modelStatsKey(route.platform, route.modelId, route.endpointScope)}`;
   if (confidence === 'probable' && !confirmObservation(key, requestToken)) return false;
 
   const reason = summarizeAttemptError((err as { message?: unknown })?.message);

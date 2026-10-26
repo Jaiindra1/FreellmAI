@@ -29,7 +29,7 @@
 
 import type { Scheduler } from '../lib/scheduler.js';
 import type { Db } from '../db/types.js';
-import { getDb } from '../db/index.js';
+import { getDb, getWorkspaceScope } from '../db/index.js';
 import { resolveProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { decryptProxyUrl } from '../lib/key-proxy.js';
@@ -242,7 +242,7 @@ interface CandidateProbeState {
 const probeState = new Map<string, CandidateProbeState>();
 
 function stateKey(candidate: ProbeCandidate): string {
-  return `${candidate.platform}:${candidate.modelId}:${candidate.endpointScope}:${candidate.keyId}`;
+  return `${getWorkspaceScope()}:${candidate.platform}:${candidate.modelId}:${candidate.endpointScope}:${candidate.keyId}`;
 }
 
 export interface ProbePassOptions extends ModelProbeRequestDeps {
@@ -307,14 +307,17 @@ export async function runModelProbePass(opts: ProbePassOptions = {}): Promise<Pr
 }
 
 // Overlap guard, same shape as checkAllKeys / runCooldownProbePass.
-let passInFlight: Promise<ProbePassResult> | null = null;
+const passInFlight = new Map<string, Promise<ProbePassResult>>();
 
 function runGuardedPass(): Promise<ProbePassResult> {
-  if (passInFlight) return passInFlight;
-  passInFlight = runModelProbePass().finally(() => {
-    passInFlight = null;
+  const scope = getWorkspaceScope();
+  const pending = passInFlight.get(scope);
+  if (pending) return pending;
+  const run = runModelProbePass().finally(() => {
+    passInFlight.delete(scope);
   });
-  return passInFlight;
+  passInFlight.set(scope, run);
+  return run;
 }
 
 let cancelProbeJob: (() => void) | null = null;
@@ -342,4 +345,5 @@ export function stopModelProbe(): void {
 /** Test seam: drop all probe pacing state. */
 export function resetModelProbeState(): void {
   probeState.clear();
+  passInFlight.clear();
 }

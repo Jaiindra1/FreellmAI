@@ -1,5 +1,6 @@
 import type { ChatMessage } from '@freellmapi/shared/types.js';
 import { contentToString } from '../lib/content.js';
+import { getWorkspaceScope } from '../db/index.js';
 
 export type ContextHandoffMode = 'off' | 'on_model_switch';
 
@@ -23,6 +24,10 @@ const MAX_STORE_SIZE = 500;
 export const HANDOFF_MAX_TOKENS = Math.ceil((MAX_HANDOFF_CHARS + 400) / 4);
 
 const store = new Map<string, SessionContext>();
+
+function scopedKey(sessionKey: string): string {
+  return `${getWorkspaceScope()}:${sessionKey}`;
+}
 
 export function getContextHandoffMode(): ContextHandoffMode {
   const raw = process.env.FREELLMAPI_CONTEXT_HANDOFF?.trim().toLowerCase();
@@ -55,6 +60,7 @@ function pruneExpired(): void {
 
 export function recordIncomingMessages(sessionKey: string, messages: ChatMessage[]): void {
   if (!sessionKey) return;
+  sessionKey = scopedKey(sessionKey);
   pruneExpired();
 
   const trimmed = messages
@@ -105,7 +111,7 @@ function buildSummary(messages: TrimmedMessage[]): string {
 // turn 1, and sessions that never switched), avoiding a needless headroom tax.
 export function hasPriorModel(sessionKey: string): boolean {
   if (!sessionKey) return false;
-  return !!store.get(sessionKey)?.lastModelKey;
+  return !!store.get(scopedKey(sessionKey))?.lastModelKey;
 }
 
 export function maybeInjectContextHandoff(params: {
@@ -117,7 +123,7 @@ export function maybeInjectContextHandoff(params: {
   const { mode, sessionKey, messages, selectedModelKey } = params;
   if (mode === 'off' || !sessionKey) return { messages, injected: false, injectedTokens: 0 };
 
-  const ctx = store.get(sessionKey);
+  const ctx = store.get(scopedKey(sessionKey));
   if (!ctx?.lastModelKey || ctx.lastModelKey === selectedModelKey) {
     return { messages, injected: false, injectedTokens: 0 };
   }
@@ -162,13 +168,14 @@ export function recordSuccessfulModel(params: {
 }): void {
   const { sessionKey, modelKey } = params;
   if (!sessionKey) return;
+  const key = scopedKey(sessionKey);
   pruneExpired();
-  const ctx = store.get(sessionKey);
+  const ctx = store.get(key);
   if (ctx) {
     ctx.lastModelKey = modelKey;
     ctx.updatedAt = Date.now();
   } else {
-    store.set(sessionKey, { lastModelKey: modelKey, recentMessages: [], updatedAt: Date.now() });
+    store.set(key, { lastModelKey: modelKey, recentMessages: [], updatedAt: Date.now() });
     if (store.size > MAX_STORE_SIZE) {
       const now = Date.now();
       for (const [k, v] of store) {

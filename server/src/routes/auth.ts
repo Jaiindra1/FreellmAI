@@ -16,7 +16,7 @@ import {
   desktopSessionToken,
 } from '../services/auth.js';
 import { setupCodeMatches, clearSetupCode } from '../lib/setup-code.js';
-import { generateResetCode, resetCodeMatches, clearResetCode } from '../lib/reset-code.js';
+import { generateResetCode, resetCodeMatches, clearResetCode, getResetCodeEmail } from '../lib/reset-code.js';
 
 export const authRouter = Router();
 
@@ -205,6 +205,35 @@ authRouter.post('/desktop-session', (req: Request, res: Response) => {
   res.json({ token: desktopSessionToken() });
 });
 
+// Open registration is deliberately separate from first-run setup. It becomes
+// available only after the initial owner has completed the protected bootstrap
+// flow, so it cannot be used to bypass the setup-code requirement on a fresh
+// remote install.
+authRouter.post('/register', (req: Request, res: Response) => {
+  if (userCount() === 0) {
+    res.status(409).json({
+      error: { message: 'Complete first-run setup before registering another account.', type: 'setup_required' },
+    });
+    return;
+  }
+  const parsed = signupSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+  try {
+    const user = createUser(parsed.data.email, parsed.data.password);
+    const token = createSession(user.userId);
+    res.status(201).json({ token, email: user.email });
+  } catch (err: any) {
+    if (err.code === 'email_taken') {
+      res.status(409).json({ error: { message: err.message, type: 'email_taken' } });
+      return;
+    }
+    throw err;
+  }
+});
+
 // First-run account creation. Only allowed while there are zero users, so it
 // can't be used to add accounts once the dashboard is claimed.
 authRouter.post('/setup', (req: Request, res: Response) => {
@@ -363,7 +392,7 @@ authRouter.post('/change-password', (req: Request, res: Response) => {
 // Forgot password: mint a reset code and log it
 const RESET_CODE_MIN_INTERVAL_MS = 10_000;
 let lastResetCodeAt = 0;
-authRouter.post('/forgot-password', (_req: Request, res: Response) => {
+authRouter.post('/forgot-password', (req: Request, res: Response) => {
   // Always respond 200 regardless of account existence to avoid user enumeration.
   if (userCount() === 0) {
     res.json({ success: true });
@@ -376,7 +405,9 @@ authRouter.post('/forgot-password', (_req: Request, res: Response) => {
     return;
   }
   lastResetCodeAt = now;
-  generateResetCode(accountEmail());
+  const requestedEmail = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+  const targetEmail = requestedEmail ? (accountEmail(requestedEmail) ?? requestedEmail) : accountEmail();
+  generateResetCode(targetEmail);
   res.json({ success: true });
 });
 
@@ -384,6 +415,7 @@ authRouter.post('/forgot-password', (_req: Request, res: Response) => {
 const resetPasswordSchema = z.object({
   resetCode: z.string().min(1, 'Reset code is required'),
   newPassword: z.string().min(8, 'Password must be at least 8 characters'),
+  email: z.string().email().optional(),
 });
 
 authRouter.post('/reset-password', (req: Request, res: Response) => {
@@ -396,7 +428,12 @@ authRouter.post('/reset-password', (req: Request, res: Response) => {
     res.status(403).json({ error: { message: 'Invalid or expired reset code', type: 'authentication_error' } });
     return;
   }
-  const user = resetUserPassword(parsed.data.newPassword);
+  const targetEmail = getResetCodeEmail();
+  if (parsed.data.email && parsed.data.email.trim().toLowerCase() !== targetEmail) {
+    res.status(403).json({ error: { message: 'Invalid or expired reset code', type: 'authentication_error' } });
+    return;
+  }
+  const user = resetUserPassword(parsed.data.newPassword, targetEmail);
   if (!user) {
     res.status(404).json({ error: { message: 'No account found', type: 'not_found' } });
     return;

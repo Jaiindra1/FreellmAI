@@ -1,4 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
+import { runInWorkspace } from '../db/index.js';
 import { validateSession } from '../services/auth.js';
 
 // Gate the /api/* admin surface behind a dashboard session (#35, item #2).
@@ -14,5 +15,5 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
     return;
   }
   (req as Request & { user?: typeof session }).user = session;
-  next();
+  runInWorkspace(session.userId, next);
 }

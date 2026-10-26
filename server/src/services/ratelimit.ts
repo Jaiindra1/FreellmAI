@@ -1,6 +1,6 @@
 // Sliding window rate limit tracker with SQLite persistence.
 
-import { getDb, getSetting, setSetting } from '../db/index.js';
+import { getDb, getSetting, setSetting, getWorkspaceScope } from '../db/index.js';
 import { isLoopbackOrPrivateUrl } from '../lib/url-guard.js';
 import { parseModelScope, scopeAllows } from '../lib/model-scope.js';
 
@@ -15,7 +15,12 @@ const windows = new Map<string, Window>();
 type RateLimitDb = ReturnType<typeof getDb>;
 type UsageKind = 'request' | 'tokens';
 
+function scopedMemoryKey(key: string): string {
+  return `${getWorkspaceScope()}:${key}`;
+}
+
 function getWindow(key: string): Window {
+  key = scopedMemoryKey(key);
   let w = windows.get(key);
   if (!w) {
     w = { timestamps: [], tokenCount: 0, tokenTimestamps: [] };
@@ -59,6 +64,7 @@ function withDb<T>(fn: (db: RateLimitDb) => T): T | undefined {
 // from zero.
 
 interface Lease {
+  workspace: string;
   platform: string;
   modelId: string;
   keyId: number;
@@ -110,7 +116,7 @@ export function inFlightForKey(platform: string, keyId: number, now = Date.now()
   pruneLeases(now);
   let count = 0;
   for (const lease of leases.values()) {
-    if (lease.platform === platform && lease.keyId === keyId) count++;
+    if (lease.workspace === getWorkspaceScope() && lease.platform === platform && lease.keyId === keyId) count++;
   }
   return count;
 }
@@ -133,7 +139,7 @@ export function acquireLease(
 ): number {
   pruneLeases(now);
   const id = nextLeaseId++;
-  leases.set(id, { platform, modelId, keyId, tokens, createdAt: now });
+  leases.set(id, { workspace: getWorkspaceScope(), platform, modelId, keyId, tokens, createdAt: now });
   return id;
 }
 
@@ -164,7 +170,7 @@ function provisionalRequests(platform: string, modelId: string, keyId: number, n
   pruneLeases(now);
   let count = 0;
   for (const lease of leases.values()) {
-    if (lease.platform === platform && lease.modelId === modelId && lease.keyId === keyId) count++;
+    if (lease.workspace === getWorkspaceScope() && lease.platform === platform && lease.modelId === modelId && lease.keyId === keyId) count++;
   }
   return count;
 }
@@ -173,7 +179,7 @@ function provisionalTokens(platform: string, modelId: string, keyId: number, now
   pruneLeases(now);
   let total = 0;
   for (const lease of leases.values()) {
-    if (lease.platform === platform && lease.modelId === modelId && lease.keyId === keyId) total += lease.tokens;
+    if (lease.workspace === getWorkspaceScope() && lease.platform === platform && lease.modelId === modelId && lease.keyId === keyId) total += lease.tokens;
   }
   return total;
 }
@@ -188,7 +194,7 @@ function provisionalProviderTokens(platform: string, keyId: number, now: number)
   pruneLeases(now);
   let total = 0;
   for (const lease of leases.values()) {
-    if (lease.platform === platform && lease.keyId === keyId) total += lease.tokens;
+    if (lease.workspace === getWorkspaceScope() && lease.platform === platform && lease.keyId === keyId) total += lease.tokens;
   }
   return total;
 }
@@ -402,7 +408,7 @@ const WINDOW_USAGE_TTL_MS = 5_000;
 let windowUsageSnapshot: WindowUsageSnapshot | null = null;
 
 function usageCacheKey(platform: string, modelId: string, keyId: number): string {
-  return `${platform}\u0000${modelId}\u0000${keyId}`;
+  return `${getWorkspaceScope()}\u0000${platform}\u0000${modelId}\u0000${keyId}`;
 }
 
 function buildWindowUsageSnapshot(now: number): WindowUsageSnapshot | null {
@@ -654,7 +660,7 @@ export function providerDailyRequestCount(platform: string, keyId: number, now =
   // Window key format is "platform:modelId:keyId:rpd" (modelId may contain ':').
   let total = 0;
   for (const [key, w] of windows) {
-    if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:rpd`)) {
+    if (key.startsWith(`${getWorkspaceScope()}:${platform}:`) && key.endsWith(`:${keyId}:rpd`)) {
       total += pruneTimestamps(w.timestamps, windowMs, now).length;
     }
   }
@@ -677,7 +683,7 @@ export function providerMinuteRequestCount(platform: string, keyId: number, now 
   // DB-unavailable fallback: sum the per-model rpm windows for this platform+key.
   let total = 0;
   for (const [key, w] of windows) {
-    if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:rpm`)) {
+    if (key.startsWith(`${getWorkspaceScope()}:${platform}:`) && key.endsWith(`:${keyId}:rpm`)) {
       total += pruneTimestamps(w.timestamps, MINUTE, now).length;
     }
   }
@@ -767,10 +773,11 @@ export function providerDailyTokenCount(platform: string, keyId: number, now = D
   if (persisted !== undefined) return persisted;
 
   let total = 0;
+  const platformPrefix = `${getWorkspaceScope()}:${platform}:`;
   const suffix = `:${keyId}:tpd`;
   for (const [key, w] of windows) {
-    if (!key.startsWith(`${platform}:`) || !key.endsWith(suffix)) continue;
-    const modelId = key.slice(platform.length + 1, -suffix.length);
+    if (!key.startsWith(platformPrefix) || !key.endsWith(suffix)) continue;
+    const modelId = key.slice(platformPrefix.length, -suffix.length);
     // Read-only: the tpd window is shared with the per-model 24h token check, so
     // narrowing it to the midnight boundary here must not prune the stored entries.
     const raw = w.tokenTimestamps
@@ -929,7 +936,7 @@ export function capCooldownMs(durationMs: number): number {
 }
 
 export function getNextCooldownDuration(platform: string, modelId: string, keyId: number): number {
-  const key = `${platform}:${modelId}:${keyId}`;
+  const key = scopedMemoryKey(`${platform}:${modelId}:${keyId}`);
   const now = Date.now();
   const hits = (cooldownHits.get(key) ?? []).filter(t => t > now - DAY);
   hits.push(now);
@@ -939,7 +946,7 @@ export function getNextCooldownDuration(platform: string, modelId: string, keyId
 }
 
 function clearCooldownHits(platform: string, modelId: string, keyId: number): void {
-  cooldownHits.delete(`${platform}:${modelId}:${keyId}`);
+  cooldownHits.delete(scopedMemoryKey(`${platform}:${modelId}:${keyId}`));
 }
 
 // Short cooldown for a transient (per-minute) 429 — recovers within ~one window.
@@ -1003,14 +1010,14 @@ const NULL_LIMIT_HIT_WINDOW_MS = HOUR;
 const nullLimitHits = new Map<string, number[]>(); // key -> timestamps
 
 function recordNullLimitHit(platform: string, modelId: string, keyId: number, now: number): void {
-  const key = `${platform}:${modelId}:${keyId}`;
+  const key = scopedMemoryKey(`${platform}:${modelId}:${keyId}`);
   const hits = nullLimitHits.get(key) ?? [];
   hits.push(now);
   nullLimitHits.set(key, hits);
 }
 
 function clearNullLimitHits(platform: string, modelId: string, keyId: number): void {
-  nullLimitHits.delete(`${platform}:${modelId}:${keyId}`);
+  nullLimitHits.delete(scopedMemoryKey(`${platform}:${modelId}:${keyId}`));
 }
 
 export function recentHitCount(
@@ -1020,7 +1027,7 @@ export function recentHitCount(
   now: number,
   windowMs: number = NULL_LIMIT_HIT_WINDOW_MS,
 ): number {
-  const key = `${platform}:${modelId}:${keyId}`;
+  const key = scopedMemoryKey(`${platform}:${modelId}:${keyId}`);
   const hits = nullLimitHits.get(key) ?? [];
   return hits.filter(t => t > now - windowMs).length;
 }
@@ -1058,10 +1065,11 @@ export const LOCAL_ENDPOINT_COOLDOWN_MS = 5_000;
 // cached for the life of the process. Built-in platforms have base_url NULL
 // → non-local. A DB that isn't ready yet is NOT cached, so a later call can
 // still decide properly.
-const keyLocality = new Map<number, boolean>(); // keyId -> is local endpoint
+const keyLocality = new Map<string, boolean>(); // workspace/keyId -> is local endpoint
 
 export function isLocalEndpointKey(keyId: number): boolean {
-  const cached = keyLocality.get(keyId);
+  const cacheKey = scopedMemoryKey(String(keyId));
+  const cached = keyLocality.get(cacheKey);
   if (cached !== undefined) return cached;
   const baseUrl = withDb(db => {
     const row = db.prepare('SELECT base_url FROM api_keys WHERE id = ?')
@@ -1070,7 +1078,7 @@ export function isLocalEndpointKey(keyId: number): boolean {
   });
   if (baseUrl === undefined) return false; // DB not ready — don't cache
   const local = isLoopbackOrPrivateUrl(baseUrl || null);
-  keyLocality.set(keyId, local);
+  keyLocality.set(cacheKey, local);
   return local;
 }
 
@@ -1246,7 +1254,7 @@ export function setCooldown(
   durationMs = 60_000,
   source: CooldownSource = 'heuristic',
 ) {
-  const key = `${platform}:${modelId}:${keyId}:cooldown`;
+  const key = scopedMemoryKey(`${platform}:${modelId}:${keyId}:cooldown`);
   const now = Date.now();
   const expiresAtMs = now + durationMs;
   cooldowns.set(key, expiresAtMs);
@@ -1254,7 +1262,7 @@ export function setCooldown(
 }
 
 export function isOnCooldown(platform: string, modelId: string, keyId: number): boolean {
-  const key = `${platform}:${modelId}:${keyId}:cooldown`;
+  const key = scopedMemoryKey(`${platform}:${modelId}:${keyId}:cooldown`);
   const now = Date.now();
   const persistedExpiry = persistedCooldownExpiry(platform, modelId, keyId);
   if (persistedExpiry !== undefined && persistedExpiry !== null) {
@@ -1341,9 +1349,10 @@ export function clearCooldownsForKey(keyId: number): number {
   // Key format is "platform:modelId:keyId:cooldown" and modelId may contain ':',
   // so match on the trailing segments rather than splitting.
   const suffix = `:${keyId}:cooldown`;
+  const scopePrefix = `${getWorkspaceScope()}:`;
   let memoryCleared = 0;
   for (const key of [...cooldowns.keys()]) {
-    if (key.endsWith(suffix)) {
+    if (key.startsWith(scopePrefix) && key.endsWith(suffix)) {
       cooldowns.delete(key);
       cooldownHits.delete(key.slice(0, -':cooldown'.length));
       memoryCleared++;
@@ -1368,10 +1377,14 @@ export function clearAllCooldowns(now = Date.now()): number {
     return Number(result.changes ?? 0);
   }) ?? 0;
   let memoryCleared = 0;
-  for (const expiry of cooldowns.values()) if (expiry > now) memoryCleared++;
-  cooldowns.clear();
-  cooldownHits.clear();
-  nullLimitHits.clear();
+  const scopePrefix = `${getWorkspaceScope()}:`;
+  for (const [key, expiry] of cooldowns) {
+    if (!key.startsWith(scopePrefix)) continue;
+    if (expiry > now) memoryCleared++;
+    cooldowns.delete(key);
+  }
+  for (const key of cooldownHits.keys()) if (key.startsWith(scopePrefix)) cooldownHits.delete(key);
+  for (const key of nullLimitHits.keys()) if (key.startsWith(scopePrefix)) nullLimitHits.delete(key);
   return Math.max(cleared, memoryCleared);
 }
 
@@ -1420,7 +1433,7 @@ export function getProbeableCooldowns(now = Date.now()): ProbeableCooldown[] {
  * it left off instead of starting back at 2 minutes.
  */
 export function clearCooldownEarly(platform: string, modelId: string, keyId: number): void {
-  cooldowns.delete(`${platform}:${modelId}:${keyId}:cooldown`);
+  cooldowns.delete(scopedMemoryKey(`${platform}:${modelId}:${keyId}:cooldown`));
   clearPersistedCooldown(platform, modelId, keyId);
 }
 

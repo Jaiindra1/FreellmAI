@@ -1,10 +1,11 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'url';
 import { runMigrationsSync } from './migrate/runner.js';
-import { initEncryptionKey, isEncryptionKeyInitialized } from '../lib/crypto.js';
+import { initEncryptionKey, isEncryptionKeyInitialized, withEncryptionKeyState } from '../lib/crypto.js';
 import { restrictAllToOwner, restrictDirToOwner } from '../lib/file-permissions.js';
 import { nodeSqliteFactory } from './node-sqlite.js';
 import type { Db, DbFactory } from './types.js';
@@ -16,12 +17,120 @@ const DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
 const runtimeRequire = createRequire(import.meta.url);
 
 let db: Db;
+const workspaceDbs = new Map<number, Db>();
+const workspaceContext = new AsyncLocalStorage<number>();
 
 export function getDb(): Db {
   if (!db) {
     throw new Error('Database not initialized. Call initDb() or connectDb() first.');
   }
+  const userId = workspaceContext.getStore();
+  return userId === undefined ? db : getWorkspaceDb(userId);
+}
+
+/** The shared identity database. Use only for account/session operations. */
+export function getAuthDb(): Db {
+  if (!db) throw new Error('Database not initialized. Call initDb() or connectDb() first.');
   return db;
+}
+
+/** Run one authenticated request against the account's private workspace DB. */
+export function runInWorkspace<T>(userId: number, callback: () => T): T {
+  return workspaceContext.run(userId, callback);
+}
+
+/** Stable namespace for process-local state that must follow a workspace. */
+export function getWorkspaceScope(): string {
+  const userId = workspaceContext.getStore();
+  return userId === undefined ? 'server' : `user:${userId}`;
+}
+
+/** Resolve a proxy credential to exactly one private workspace. */
+export type ProxyWorkspaceResolution =
+  | { userId: number }
+  | { userId: null }
+  | { ambiguous: true };
+
+export function resolveWorkspaceForProxyToken(token: string | undefined): ProxyWorkspaceResolution {
+  if (!token) return { userId: null };
+  const users = getAuthDb().prepare('SELECT id FROM users ORDER BY id').all() as Array<{ id: number }>;
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const matches: number[] = [];
+  for (const { id } of users) {
+    const workspace = getWorkspaceDb(id);
+    const unified = workspace.prepare(
+      "SELECT value FROM settings WHERE key = 'unified_api_key'",
+    ).get() as { value: string } | undefined;
+    const profile = workspace.prepare(
+      'SELECT id FROM client_profiles WHERE token_hash = ? AND enabled = 1',
+    ).get(tokenHash);
+    const urlToken = workspace.prepare(
+      "SELECT id FROM url_tokens WHERE token_hash = ? AND revoked_at IS NULL",
+    ).get(tokenHash);
+    if ((unified && constantTimeEqual(token, unified.value)) || profile || urlToken) matches.push(id);
+  }
+
+  function constantTimeEqual(provided: string, expected: string): boolean {
+    const key = Buffer.alloc(32);
+    const a = crypto.createHmac('sha256', key).update(provided).digest();
+    const b = crypto.createHmac('sha256', key).update(expected).digest();
+    return crypto.timingSafeEqual(a, b);
+  }
+  // Duplicate credentials must never choose one account nondeterministically.
+  if (matches.length > 1) return { ambiguous: true };
+  return matches.length === 1 ? { userId: matches[0]! } : { userId: null };
+}
+
+export function findWorkspaceForProxyToken(token: string | undefined): number | null {
+  const resolution = resolveWorkspaceForProxyToken(token);
+  return 'userId' in resolution ? resolution.userId : null;
+}
+
+function workspacePath(userId: number): string {
+  const row = db.prepare('SELECT workspace_id FROM users WHERE id = ?')
+    .get(userId) as { workspace_id: string } | undefined;
+  if (!row || !/^user:\d+$/.test(row.workspace_id)) {
+    throw new Error(`Invalid workspace identity for account ${userId}`);
+  }
+  return path.join(workspaceRoot(), 'users', `${row.workspace_id.replace(':', '-')}.db`);
+}
+
+function workspaceRoot(): string {
+  const currentPath = db.name && db.name !== ':memory:' ? db.name : getDefaultDbPath();
+  return path.dirname(currentPath);
+}
+
+function getWorkspaceDb(userId: number): Db {
+  // The earliest account owns the pre-multitenant database. Its existing rows
+  // are deliberately left there and can never be inherited by later signups.
+  const firstUser = db.prepare('SELECT id FROM users ORDER BY id LIMIT 1').get() as { id: number } | undefined;
+  if (firstUser?.id === userId) return db;
+  const cached = workspaceDbs.get(userId);
+  if (cached) return cached;
+
+  const inMemory = db.memory === true || db.name === ':memory:';
+  const resolvedPath = inMemory ? ':memory:' : workspacePath(userId);
+  const dataDir = path.dirname(resolvedPath);
+  if (!inMemory) {
+    const createdDataDir = !fs.existsSync(dataDir);
+    fs.mkdirSync(dataDir, { recursive: true });
+    restrictDataDir(dataDir, createdDataDir);
+
+    // All workspaces use the installation's encryption key. In dev, copy the
+    // already-created key file before migrations initialize the new database.
+    const masterKeyFile = path.join(workspaceRoot(), '.encryption-key');
+    const workspaceKeyFile = path.join(dataDir, '.encryption-key');
+    if (fs.existsSync(masterKeyFile) && !fs.existsSync(workspaceKeyFile)) {
+      fs.copyFileSync(masterKeyFile, workspaceKeyFile);
+      restrictAllToOwner([workspaceKeyFile]);
+    }
+  }
+
+  const workspaceDb = openConnection(resolvedPath, {});
+  withEncryptionKeyState(() => runMigrationsSync(workspaceDb, 'up'));
+  if (!isEncryptionKeyInitialized()) initEncryptionKey(workspaceDb);
+  workspaceDbs.set(userId, workspaceDb);
+  return workspaceDb;
 }
 
 export function getDefaultDbPath(): string {
@@ -78,18 +187,24 @@ export function connectDb(
     restrictDataDir(dataDir, created);
   }
 
-  db = factory(resolvedPath);
-  if (!isMemory) db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  // The dashboard and the proxy hot path write concurrently; without a busy
-  // timeout the loser of a write race gets SQLITE_BUSY immediately and the
-  // request fails. Five seconds is far longer than any write here takes.
-  db.pragma('busy_timeout = 5000');
-
-  if (!isMemory) restrictDbFilePermissions(resolvedPath);
-
+  for (const workspaceDb of workspaceDbs.values()) workspaceDb.close?.();
+  workspaceDbs.clear();
+  db = openConnection(resolvedPath, { factory, isMemory });
   console.log(`Database initialized at ${resolvedPath}`);
   return db;
+}
+
+function openConnection(
+  resolvedPath: string,
+  opts: { factory?: DbFactory; isMemory?: boolean },
+): Db {
+  const isMemory = opts.isMemory ?? resolvedPath === ':memory:';
+  const connection = (opts.factory ?? defaultDbFactory())(resolvedPath);
+  if (!isMemory) connection.pragma('journal_mode = WAL');
+  connection.pragma('foreign_keys = ON');
+  connection.pragma('busy_timeout = 5000');
+  if (!isMemory) restrictDbFilePermissions(resolvedPath);
+  return connection;
 }
 
 /**

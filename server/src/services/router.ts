@@ -1,4 +1,4 @@
-import { getDb, getSetting, setSetting } from '../db/index.js';
+import { getDb, getSetting, setSetting, getWorkspaceScope } from '../db/index.js';
 import { getProvider, hasProvider, resolveProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { decryptProxyUrl } from '../lib/key-proxy.js';
@@ -266,7 +266,11 @@ const roundRobinIndex = new Map<string, number>();
 
 // ── Dynamic priority: track 429s per model and demote accordingly ──
 // Key: model_db_id → { count, lastHit, penalty }
-const rateLimitPenalties = new Map<number, { count: number; lastHit: number; penalty: number }>();
+const rateLimitPenalties = new Map<string, { count: number; lastHit: number; penalty: number }>();
+
+function scopedModelKey(modelDbId: number): string {
+  return `${getWorkspaceScope()}:${modelDbId}`;
+}
 
 // Penalty decays over time so models recover
 const PENALTY_PER_429 = 3;        // each 429 adds this many priority positions
@@ -283,7 +287,8 @@ const DECAY_AMOUNT = 1;            // remove this much penalty per decay interva
  * longer-lived health cue.
  */
 export function recordModelFailure(modelDbId: number, weight = PENALTY_PER_FAIL) {
-  const existing = rateLimitPenalties.get(modelDbId);
+  const key = scopedModelKey(modelDbId);
+  const existing = rateLimitPenalties.get(key);
   const now = Date.now();
   if (existing) {
     const decaySteps = Math.floor((now - existing.lastHit) / DECAY_INTERVAL_MS);
@@ -292,7 +297,7 @@ export function recordModelFailure(modelDbId: number, weight = PENALTY_PER_FAIL)
     existing.lastHit = now;
     existing.penalty = Math.min(existing.penalty + weight, MAX_PENALTY);
   } else {
-    rateLimitPenalties.set(modelDbId, { count: 1, lastHit: now, penalty: weight });
+    rateLimitPenalties.set(key, { count: 1, lastHit: now, penalty: weight });
   }
 }
 
@@ -308,11 +313,12 @@ export function recordRateLimitHit(modelDbId: number) {
  * Record a success for a model — reduces its penalty so it rises back up.
  */
 export function recordSuccess(modelDbId: number) {
-  const existing = rateLimitPenalties.get(modelDbId);
+  const key = scopedModelKey(modelDbId);
+  const existing = rateLimitPenalties.get(key);
   if (existing) {
     existing.penalty = Math.max(0, existing.penalty - 1);
     if (existing.penalty === 0) {
-      rateLimitPenalties.delete(modelDbId);
+      rateLimitPenalties.delete(key);
     }
   }
 }
@@ -324,14 +330,15 @@ export function recordSuccess(modelDbId: number) {
  * routing call.
  */
 function getPenalty(modelDbId: number): number {
-  const entry = rateLimitPenalties.get(modelDbId);
+  const key = scopedModelKey(modelDbId);
+  const entry = rateLimitPenalties.get(key);
   if (!entry) return 0;
 
   const elapsed = Date.now() - entry.lastHit;
   const decaySteps = Math.floor(elapsed / DECAY_INTERVAL_MS);
   const decayed = Math.max(0, entry.penalty - decaySteps * DECAY_AMOUNT);
   if (decayed === 0) {
-    rateLimitPenalties.delete(modelDbId);
+    rateLimitPenalties.delete(key);
     return 0;
   }
   return decayed;
@@ -342,7 +349,10 @@ function getPenalty(modelDbId: number): number {
  */
 export function getAllPenalties(): Array<{ modelDbId: number; count: number; penalty: number }> {
   const result: Array<{ modelDbId: number; count: number; penalty: number }> = [];
-  for (const [modelDbId, entry] of rateLimitPenalties) {
+  const scopePrefix = `${getWorkspaceScope()}:`;
+  for (const [key, entry] of rateLimitPenalties) {
+    if (!key.startsWith(scopePrefix)) continue;
+    const modelDbId = Number(key.slice(scopePrefix.length));
     const penalty = getPenalty(modelDbId);
     if (penalty > 0) {
       result.push({ modelDbId, count: entry.count, penalty });
@@ -359,7 +369,10 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
  */
 export function clearAllPenalties(): number {
   const count = getAllPenalties().length;
-  rateLimitPenalties.clear();
+  const scopePrefix = `${getWorkspaceScope()}:`;
+  for (const key of rateLimitPenalties.keys()) {
+    if (key.startsWith(scopePrefix)) rateLimitPenalties.delete(key);
+  }
   return count;
 }
 
@@ -689,12 +702,17 @@ function sanitizeCommunityPriors(priors: unknown): CommunityPriorMap {
 // sqlite + JSON.parse on every lookup is pure waste. Invalidated by the two
 // setters and by refreshStatsCache, so tests and future ingestion see writes
 // immediately.
-let communityPriorCache: { map: CommunityPriorMap; enabled: boolean } | null = null;
-let communityPriorCacheTime = 0;
+const communityPriorCache = new Map<string, {
+  map: CommunityPriorMap;
+  enabled: boolean;
+  cachedAt: number;
+}>();
 
 function communityPriorState(): { map: CommunityPriorMap; enabled: boolean } {
+  const scope = getWorkspaceScope();
   const now = Date.now();
-  if (communityPriorCache && now - communityPriorCacheTime < CACHE_TTL_MS) return communityPriorCache;
+  const cached = communityPriorCache.get(scope);
+  if (cached && now - cached.cachedAt < CACHE_TTL_MS) return cached;
   let map: CommunityPriorMap = {};
   const raw = getSetting(COMMUNITY_PRIOR_KEY);
   if (raw) {
@@ -702,13 +720,13 @@ function communityPriorState(): { map: CommunityPriorMap; enabled: boolean } {
       map = sanitizeCommunityPriors(JSON.parse(raw));
     } catch { /* corrupt setting → no priors */ }
   }
-  communityPriorCache = { map, enabled: getSetting(COMMUNITY_PRIOR_ENABLED_KEY) === '1' };
-  communityPriorCacheTime = now;
-  return communityPriorCache;
+  const state = { map, enabled: getSetting(COMMUNITY_PRIOR_ENABLED_KEY) === '1', cachedAt: now };
+  communityPriorCache.set(scope, state);
+  return state;
 }
 
 function invalidateCommunityPriorCache(): void {
-  communityPriorCache = null;
+  communityPriorCache.delete(getWorkspaceScope());
 }
 
 /** Whether stored community priors are folded into the posterior. Default off. */
@@ -818,9 +836,17 @@ interface KeyStats {
 // Keyed by modelStatsKey(): "platform:model_id" for catalog models, and
 // "custom:model_id@base_url" for a relay model that carries an endpoint scope
 // (#651). A single-endpoint install produces the same keys it always did.
-let statsCache: Map<string, ModelStats> | null = null;
-let keyStatsCache: Map<string, KeyStats> | null = null; // "platform:model_id:key_id"
-let statsCacheTime = 0;
+interface StatsCacheState {
+  stats: Map<string, ModelStats>;
+  keyStats: Map<string, KeyStats>;
+  cachedAt: number;
+}
+
+const statsCaches = new WeakMap<Db, StatsCacheState>();
+
+function currentStatsCache(): StatsCacheState | undefined {
+  return statsCaches.get(getDb());
+}
 
 function decayWeight(ageDays: number): number {
   return Math.pow(0.5, Math.max(0, ageDays) / HALF_LIFE_DAYS);
@@ -846,7 +872,8 @@ function customEndpointScopes(db: Db): Map<number, string> {
 }
 
 export function refreshStatsCache(db: Db, force = false): void {
-  if (!force && statsCache && Date.now() - statsCacheTime < CACHE_TTL_MS) return;
+  const cached = statsCaches.get(db);
+  if (!force && cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) return;
 
   // Re-read the community priors alongside the stats they season, so a forced
   // refresh (tests, admin actions) never routes on a stale prior snapshot.
@@ -971,16 +998,15 @@ export function refreshStatsCache(db: Db, force = false): void {
     });
   }
 
-  statsCache = next;
-  keyStatsCache = nextKeys;
-  statsCacheTime = Date.now();
+  statsCaches.set(db, { stats: next, keyStats: nextKeys, cachedAt: Date.now() });
 
   // Natural tail of a recompute: fold what we just measured back into
   // models.speed_rank (#619). Never allowed to break routing — the caches above
   // are already published, and a failed write just means the column keeps its
   // previous value until the next pass.
-  if (Date.now() - speedRankWriteTime >= SPEED_RANK_WRITE_INTERVAL_MS) {
-    speedRankWriteTime = Date.now();
+  const lastWrite = speedRankWriteTime.get(db) ?? 0;
+  if (Date.now() - lastWrite >= SPEED_RANK_WRITE_INTERVAL_MS) {
+    speedRankWriteTime.set(db, Date.now());
     try {
       writeObservedSpeedRanks(db);
     } catch (e) {
@@ -1010,11 +1036,11 @@ export function refreshStatsCache(db: Db, force = false): void {
 // than a one-shot migration.
 export const SPEED_RANK_MIN_SAMPLES = 20;
 const SPEED_RANK_WRITE_INTERVAL_MS = 10 * 60 * 1000;
-let speedRankWriteTime = 0;
+const speedRankWriteTime = new WeakMap<Db, number>();
 
 /** Test hook: forget when the last writeback ran so the next refresh does one. */
 export function resetSpeedRankWriteback(): void {
-  speedRankWriteTime = 0;
+  speedRankWriteTime.delete(getDb());
 }
 
 /**
@@ -1024,6 +1050,7 @@ export function resetSpeedRankWriteback(): void {
  * calls this from its own tail).
  */
 export function writeObservedSpeedRanks(db: Db): number {
+  const statsCache = statsCaches.get(db)?.stats;
   if (!statsCache || statsCache.size === 0) return 0;
 
   const pinned = modelsWithOverriddenField(db, 'speedRank');
@@ -1039,7 +1066,7 @@ export function writeObservedSpeedRanks(db: Db): number {
       // measured stats are per endpoint, so each relay's copy gets its own
       // observed rank instead of one shared number (#651).
       if (pinned.has(`${row.platform}:${row.model_id}`)) continue;
-      const stats = statsCache!.get(modelStatsKey(row.platform, row.model_id, row.endpoint_scope));
+      const stats = statsCache.get(modelStatsKey(row.platform, row.model_id, row.endpoint_scope));
       if (!stats || stats.speedSamples < SPEED_RANK_MIN_SAMPLES) continue;
       const rank = observedSpeedRank(speedScore(stats.tokPerSec, stats.avgTtfbMs));
       if (rank === row.speed_rank) continue;
@@ -1097,7 +1124,7 @@ function scoreChainEntry(
   keyCounts: Map<string, number>,
   headroomCfg: HeadroomThresholds,
 ): ScoredEntry {
-  const stats = statsCache?.get(modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope));
+  const stats = currentStatsCache()?.stats.get(modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope));
   const successes = stats?.successes ?? 0;
   const failures = stats?.failures ?? 0;
 
@@ -1171,7 +1198,7 @@ export function applyReliabilityFloor(chain: ChainRow[]): ChainRow[] {
   const kept: ChainRow[] = [];
   const dropped: ChainRow[] = [];
   for (const e of chain) {
-    const stats = statsCache?.get(modelStatsKey(e.platform, e.model_id, e.endpoint_scope));
+    const stats = currentStatsCache()?.stats.get(modelStatsKey(e.platform, e.model_id, e.endpoint_scope));
     const total = (stats?.successes ?? 0) + (stats?.failures ?? 0);
     if (total < EXPLORE_MIN_SAMPLES) {
       kept.push(e); // not enough signal yet — keep exploring
@@ -1494,6 +1521,7 @@ const KEY_SCORE_WEIGHTS = { reliability: 0.75, speed: 0.25 };
  * the caller to keep the legacy round-robin rotation (no signal → no ranking).
  */
 function orderKeysByScore(entry: ChainRow, keys: KeyRow[]): KeyRow[] | null {
+  const keyStatsCache = currentStatsCache()?.keyStats;
   if (keys.length < 2 || !keyStatsCache) return null;
   const prefix = `${modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope)}:`;
   if (!keys.some(k => keyStatsCache!.has(prefix + k.id))) return null;
@@ -1570,12 +1598,13 @@ function orderKeysByRemainingQuota(entry: ChainRow, ordered: KeyRow[]): KeyRow[]
 // encrypted_key, so stale entries can never be served and there is no hook to
 // wire. ponytail: unbounded Map; a keys page refresh prunes nothing, but one
 // entry is ~64 bytes and key counts are human-scale.
-const decryptCache = new Map<number, { ct: string; plain: string }>();
+const decryptCache = new Map<string, { ct: string; plain: string }>();
 function cachedDecrypt(keyId: number, ct: string, iv: string, authTag: string): string {
-  const hit = decryptCache.get(keyId);
+  const cacheKey = `${getWorkspaceScope()}:${keyId}`;
+  const hit = decryptCache.get(cacheKey);
   if (hit && hit.ct === ct) return hit.plain;
   const plain = decrypt(ct, iv, authTag);
-  decryptCache.set(keyId, { ct, plain });
+  decryptCache.set(cacheKey, { ct, plain });
   return plain;
 }
 
@@ -1627,7 +1656,7 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
   refreshStatsCache(db);
   // Scoped so two relays offering the same model id don't share one rotation
   // cursor over the platform's key list (#651).
-  const rrKey = modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope);
+  const rrKey = `${getWorkspaceScope()}:${modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope)}`;
   let idx = roundRobinIndex.get(rrKey) ?? 0;
   let ranked = orderKeysByScore(entry, keys);
 
@@ -2193,7 +2222,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     const overrides = getModelWeightOverrides();
     const unmeasured = sortedChain.filter(e => {
       if (overrides.get(e.model_id) === 0) return false;
-      const stats = statsCache?.get(modelStatsKey(e.platform, e.model_id, e.endpoint_scope));
+      const stats = currentStatsCache()?.stats.get(modelStatsKey(e.platform, e.model_id, e.endpoint_scope));
       if ((stats?.successes ?? 0) + (stats?.failures ?? 0) >= EXPLORE_MIN_SAMPLES) return false;
       // Mirror the main loop's gates below so exploration only samples
       // candidates that can actually serve this request.
@@ -2450,7 +2479,7 @@ export function getRoutingScores(): { strategy: RoutingStrategy; keySelectionStr
 
   const scores: RoutingScore[] = chain.map(entry => {
     const scored = scoreChainEntry(entry, weights, intelMin, intelMax, false, keyCounts, headroomCfg);
-    const stats = statsCache?.get(modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope));
+    const stats = currentStatsCache()?.stats.get(modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope));
     return {
       modelDbId: entry.model_db_id,
       platform: entry.platform,
